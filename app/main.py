@@ -6,10 +6,10 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 
 from .config import Settings
@@ -21,26 +21,111 @@ from .imaging import (
     load_oriented,
     render_publication,
 )
-from .models import AnnotationsPut, BatchPublishRequest, WithdrawRequest
+from .models import (
+    AnnotationsPut,
+    BatchPublishRequest,
+    PublishRequest,
+    WithdrawRequest,
+)
 
 MEDIA_TYPES = {"PNG": "image/png", "JPEG": "image/jpeg"}
+
+# 定时公开的最大提前量：首次提交时公开时间不得晚于当前时刻 30 天
+MAX_PUBLISH_DELAY = timedelta(days=30)
 
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _now_dt() -> datetime:
+    """当前时刻（UTC，aware）。单独成函数便于测试注入固定时钟。"""
+    return datetime.now(timezone.utc)
+
+
+def _stored_publish_at_dt(value: str) -> datetime:
+    """解析库内规范化存储的公开时间（UTC ISO 8601，尾部 Z）。"""
+    return datetime.fromisoformat(value)
+
+
+def _parse_publish_at(raw: str) -> tuple[datetime, str]:
+    """解析调用方指定的公开时间。
+
+    仅接受带时区偏移的 RFC 3339/ISO 8601 字符串（尾部 ``Z`` 等同 +00:00），
+    统一换算为 UTC；返回 (aware UTC datetime, 规范化时间字符串)。
+    无法解析或为朴素时间（无偏移）均属无效时间，调用方据此返回 400。
+    """
+    text = raw.strip()
+    if not text:
+        _error(
+            400,
+            "invalid_publish_time",
+            "publish_at must be an RFC 3339 / ISO 8601 date-time with a"
+            " timezone offset (UTC recommended), e.g."
+            " 2026-10-06T08:00:00Z; use null or omit the field to publish"
+            " immediately",
+        )
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        _error(
+            400,
+            "invalid_publish_time",
+            "publish_at must be an RFC 3339 / ISO 8601 date-time with a"
+            " timezone offset (UTC recommended), e.g."
+            " 2026-10-06T08:00:00Z",
+        )
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        _error(
+            400,
+            "invalid_publish_time",
+            "publish_at must carry a timezone offset; a naive local time is"
+            " ambiguous, use e.g. 2026-10-06T08:00:00Z",
+        )
+    dt_utc = dt.astimezone(timezone.utc)
+    # 规范化为统一的 UTC 文本（尾部 Z）；Python 3.11 的 fromisoformat 可直接读回
+    normalized = dt_utc.isoformat().replace("+00:00", "Z")
+    return dt_utc, normalized
+
+
+def _check_publish_window(dt_utc: datetime) -> None:
+    """首次提交的窗口校验：必须晚于当前时刻，且不超过 30 天。
+
+    幂等键重放路径不调用本函数——首次结果原样返回，即使公开时间已过也不
+    重新校验。
+    """
+    now = _now_dt()
+    if dt_utc <= now:
+        _error(
+            400,
+            "invalid_publish_time",
+            "publish_at must be later than the current time",
+        )
+    if dt_utc - now > MAX_PUBLISH_DELAY:
+        _error(
+            400,
+            "invalid_publish_time",
+            "publish_at must be no more than 30 days in the future",
+        )
+
+
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _batch_request_hash(items: Any) -> str:
-    """幂等键绑定的内容摘要：按请求顺序排列的 (doc_id, expected_revision)。"""
+def _batch_request_hash(items: Any, publish_at: str | None) -> str:
+    """幂等键绑定的内容摘要：按请求顺序排列的 (doc_id, expected_revision)
+    列表，加上整批统一的公开时间（含"立即公开"的 null）。"""
     canonical = json.dumps(
-        [
-            {"doc_id": it.doc_id, "expected_revision": it.expected_revision}
-            for it in items
-        ],
+        {
+            "documents": [
+                {"doc_id": it.doc_id, "expected_revision": it.expected_revision}
+                for it in items
+            ],
+            "publish_at": publish_at,
+        },
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -72,11 +157,12 @@ def _rect_out(row: Any) -> dict:
 
 
 def _pub_entry(row: Any, keys: list[str]) -> dict:
-    """发布记录条目：原字段按序输出，末尾追加撤回状态三字段。
+    """发布记录条目：原字段按序输出，末尾依次追加公开时间与撤回状态字段。
 
-    查询须以 LEFT JOIN 带出 w_at / w_reason 两列（见各列表端点）。
+    查询须以列别名带出 p_at / w_at / w_reason（见各列表端点）。
     """
     out = {k: row[k] for k in keys}
+    out["publish_at"] = row["p_at"]
     out["withdrawn"] = row["w_at"] is not None
     out["withdrawn_at"] = row["w_at"]
     out["withdrawal_reason"] = row["w_reason"]
@@ -154,6 +240,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "publication_withdrawn",
                 f"document '{doc_id}' publication version {version} has been"
                 " withdrawn and is no longer publicly available",
+            )
+
+    def _ensure_publish_time_reached(pub: Any) -> None:
+        """未到公开时间的版本对公开面表现为 404（与未知版本一致）。
+
+        既不返回成品，也不返回遮盖坐标/原因、摘要等任何版本信息；
+        公开时间到达后无需任何额外操作即可读取。调用前必须先完成
+        撤回检查——永久撤回优先于公开时间，撤回版本一律 410。
+        """
+        publish_at = pub["publish_at"]
+        if publish_at is not None and _stored_publish_at_dt(
+            publish_at
+        ) > _now_dt():
+            _error(
+                404,
+                "publication_not_yet_public",
+                f"publication is scheduled to become public at {publish_at}",
             )
 
     # ---------------- 基本 ----------------
@@ -234,7 +337,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             doc = _get_doc(conn, doc_id)
             pubs = conn.execute(
                 "SELECT p.version, p.annotation_revision, p.output_sha256,"
-                " p.created_at" + _WITHDRAWAL_COLS +
+                " p.created_at, p.publish_at AS p_at" + _WITHDRAWAL_COLS +
                 " FROM publications p" + _WITHDRAWAL_JOIN.format(t="p") +
                 " WHERE p.doc_id = ? ORDER BY p.version",
                 (doc_id,),
@@ -338,13 +441,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # ---------------- 发布 ----------------
 
     @app.post("/documents/{doc_id}/publish", status_code=201)
-    def publish_document(doc_id: str) -> dict:
+    def publish_document(
+        doc_id: str, body: PublishRequest | None = Body(default=None)
+    ) -> dict:
+        # 公开时间在进入事务前解析（格式无效即 400，无任何副作用）；
+        # "晚于当前且不超过 30 天"的窗口校验在写事务内完成。
+        publish_at: str | None = None
+        publish_dt: datetime | None = None
+        if body is not None and body.publish_at is not None:
+            publish_dt, publish_at = _parse_publish_at(body.publish_at)
+
         output_path: str | None = None
         try:
-            # 整个"读修订+读矩形+渲染+落盘+写记录"在一个写事务内，
-            # 与标注修改互斥，保证成品与记录的修订号一致。
+            # 整个"窗口校验+读修订+读矩形+渲染+落盘+写记录"在一个写事务内，
+            # 与标注修改互斥，保证成品与记录的修订号一致；定时版本同样在发布
+            # 当下固化成品并占用正常版本号，只是公开时间到达前对外 404。
             with write_tx(settings.db_path) as conn:
                 doc = _get_doc(conn, doc_id)
+                if publish_dt is not None:
+                    _check_publish_window(publish_dt)
                 revision = doc["annotation_revision"]
                 rects = conn.execute(
                     "SELECT x, y, w, h, reason FROM annotation_rects"
@@ -380,8 +495,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 now = _utcnow()
                 conn.execute(
                     "INSERT INTO publications (doc_id, version, annotation_revision,"
-                    " original_sha256, output_sha256, output_path, created_at)"
-                    " VALUES (?,?,?,?,?,?,?)",
+                    " original_sha256, output_sha256, output_path, created_at,"
+                    " publish_at) VALUES (?,?,?,?,?,?,?,?)",
                     (
                         doc_id,
                         version,
@@ -390,6 +505,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         output_sha256,
                         output_path,
                         now,
+                        publish_at,
                     ),
                 )
         except Exception:
@@ -408,6 +524,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "output_sha256": output_sha256,
             "redaction_count": len(rects),
             "created_at": now,
+            "publish_at": publish_at,  # null=立即公开；否则为统一 UTC 公开时间
         }
 
     @app.get("/documents/{doc_id}/publications")
@@ -416,7 +533,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             _get_doc(conn, doc_id)
             pubs = conn.execute(
                 "SELECT p.version, p.annotation_revision, p.original_sha256,"
-                " p.output_sha256, p.created_at" + _WITHDRAWAL_COLS +
+                " p.output_sha256, p.created_at, p.publish_at AS p_at"
+                + _WITHDRAWAL_COLS +
                 " FROM publications p" + _WITHDRAWAL_JOIN.format(t="p") +
                 " WHERE p.doc_id = ? ORDER BY p.version",
                 (doc_id,),
@@ -438,7 +556,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def publish_batch(body: BatchPublishRequest) -> Any:
         items = body.documents
         key = body.idempotency_key
-        request_hash = _batch_request_hash(items) if key is not None else None
+        # 整批统一的公开时间：先解析（格式无效直接 400，不进入事务、
+        # 不占版本/批次/幂等键），规范化值同时纳入幂等内容摘要。
+        publish_at: str | None = None
+        publish_dt: datetime | None = None
+        if body.publish_at is not None:
+            publish_dt, publish_at = _parse_publish_at(body.publish_at)
+        request_hash = (
+            _batch_request_hash(items, publish_at) if key is not None else None
+        )
 
         batch_id = uuid.uuid4().hex
         now = _utcnow()
@@ -477,7 +603,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             " unchanged",
                         )
 
-                # 语义校验：数量与重复（失败即回滚，不占用幂等键、不涉及版本号）
+                # 语义校验：公开时间窗口、数量与重复（失败即回滚，不占用
+                # 幂等键、不涉及版本号）。窗口校验只在首次请求进行——
+                # 重放已在上方直接返回，即使公开时间已过也不重新校验。
+                if publish_dt is not None:
+                    _check_publish_window(publish_dt)
                 if not 2 <= len(items) <= 20:
                     _error(
                         400,
@@ -586,7 +716,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     conn.execute(
                         "INSERT INTO publications (doc_id, version, annotation_revision,"
                         " original_sha256, output_sha256, output_path, created_at,"
-                        " batch_id) VALUES (?,?,?,?,?,?,?,?)",
+                        " batch_id, publish_at) VALUES (?,?,?,?,?,?,?,?,?)",
                         (
                             doc["id"],
                             version,
@@ -596,6 +726,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             output_path,
                             now,
                             batch_id,
+                            publish_at,
                         ),
                     )
                     result_items.append(
@@ -612,8 +743,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     )
 
                 conn.execute(
-                    "INSERT INTO publication_batches (id, created_at) VALUES (?,?)",
-                    (batch_id, now),
+                    "INSERT INTO publication_batches (id, created_at, publish_at)"
+                    " VALUES (?,?,?)",
+                    (batch_id, now, publish_at),
                 )
                 for out in result_items:
                     conn.execute(
@@ -636,6 +768,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "created_at": now,
                     "count": len(result_items),
                     "documents": result_items,  # 顺序与请求一致
+                    "publish_at": publish_at,   # null=立即公开；否则为整批统一 UTC 公开时间
                 }
                 if key is not None:
                     # 首次成功：持久化键与完整成功结果，同事务提交
@@ -665,7 +798,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def get_publication_batch(batch_id: str) -> dict:
         with read_tx(settings.db_path) as conn:
             batch = conn.execute(
-                "SELECT id, created_at FROM publication_batches WHERE id = ?",
+                "SELECT id, created_at, publish_at FROM publication_batches"
+                " WHERE id = ?",
                 (batch_id,),
             ).fetchone()
             if batch is None:
@@ -676,8 +810,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             rows = conn.execute(
                 "SELECT bp.position, bp.doc_id, bp.version, bp.annotation_revision,"
-                " bp.original_sha256, bp.output_sha256" + _WITHDRAWAL_COLS +
-                " FROM batch_publications bp" + _WITHDRAWAL_JOIN.format(t="bp") +
+                " bp.original_sha256, bp.output_sha256, p.publish_at AS p_at"
+                + _WITHDRAWAL_COLS +
+                " FROM batch_publications bp"
+                " JOIN publications p ON p.doc_id = bp.doc_id AND p.version = bp.version"
+                + _WITHDRAWAL_JOIN.format(t="bp") +
                 " WHERE bp.batch_id = ? ORDER BY bp.position",
                 (batch_id,),
             ).fetchall()
@@ -692,6 +829,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 for r in rows
             ],  # 顺序与原请求一致
+            "publish_at": batch["publish_at"],
         }
 
     # ---------------- 版本撤回（永久，幂等） ----------------
@@ -762,7 +900,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def get_publication(doc_id: str, version: int) -> dict:
         with read_tx(settings.db_path) as conn:
             pub = _get_publication(conn, doc_id, version)
+            # 永久撤回优先于公开时间：已撤回版本一律 410
             _ensure_not_withdrawn(conn, doc_id, version)
+            # 未到公开时间：404，不返回遮盖信息、摘要等任何版本内容
+            _ensure_publish_time_reached(pub)
             rects = conn.execute(
                 "SELECT x, y, w, h, reason FROM annotation_rects"
                 " WHERE doc_id = ? AND revision = ? ORDER BY idx",
@@ -776,6 +917,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "output_sha256": pub["output_sha256"],
             "created_at": pub["created_at"],
             "redactions": [_rect_out(r) for r in rects],
+            "publish_at": pub["publish_at"],
         }
 
     @app.get("/publications/{doc_id}/{version}/image")
@@ -783,6 +925,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with read_tx(settings.db_path) as conn:
             pub = _get_publication(conn, doc_id, version)
             _ensure_not_withdrawn(conn, doc_id, version)
+            _ensure_publish_time_reached(pub)
         path = pub["output_path"]
         if not os.path.exists(path):
             _error(

@@ -16,6 +16,10 @@
 - 撤回记录（publication_withdrawals）按 (doc_id, version) 追加存储、
   永不改写：重复撤回命中主键直接返回首次记录；撤回只插入该表，
   publications 行、成品文件与版本号序列全部保留。
+- 定时公开时间（publications.publish_at / publication_batches.publish_at）
+  在发布事务内一并固化：成品与版本号在发布当下就生成/占用，"未到点"仅是
+  公开读取时按当前 UTC 时间做的判定，到点无需任何补操作；列为 NULL 即立即
+  公开。失败事务回滚时该列随记录一并消失，不留下定时版本。
 """
 from __future__ import annotations
 
@@ -57,12 +61,14 @@ CREATE TABLE IF NOT EXISTS publications (
     output_path         TEXT NOT NULL,
     created_at          TEXT NOT NULL,
     batch_id            TEXT,
+    publish_at          TEXT,                 -- 统一 UTC 公开时间；NULL=立即公开
     PRIMARY KEY (doc_id, version)
 );
 
 CREATE TABLE IF NOT EXISTS publication_batches (
     id         TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    publish_at TEXT                            -- 整批统一 UTC 公开时间；NULL=立即公开
 );
 
 CREATE TABLE IF NOT EXISTS batch_publications (
@@ -102,10 +108,17 @@ def init_db(db_path: str) -> None:
     conn.row_factory = sqlite3.Row
     try:
         conn.executescript(SCHEMA)
-        # 轻量迁移：旧卷上的 publications 表可能没有 batch_id 列
+        # 轻量迁移：旧卷上的 publications 表可能没有 batch_id / publish_at 列
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(publications)")}
         if "batch_id" not in cols:
             conn.execute("ALTER TABLE publications ADD COLUMN batch_id TEXT")
+        if "publish_at" not in cols:
+            conn.execute("ALTER TABLE publications ADD COLUMN publish_at TEXT")
+        bcols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(publication_batches)")}
+        if "publish_at" not in bcols:
+            conn.execute(
+                "ALTER TABLE publication_batches ADD COLUMN publish_at TEXT")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.commit()
     finally:

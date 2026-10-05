@@ -26,16 +26,29 @@ class BatchItem(BaseModel):
     expected_revision: int = Field(ge=0)
 
 
+class PublishRequest(BaseModel):
+    """单份发布请求（整体可选）：可指定统一的 UTC 公开时间。
+
+    省略请求体或 ``publish_at`` 省略/为 null 时仍立即公开；``publish_at``
+    为 RFC 3339/ISO 8601 时间字符串，必须携带时区偏移，语义校验（晚于当前
+    时刻且不超过 30 天、空白字符串等无效值）在路由内统一返回业务错误码。
+    """
+
+    publish_at: str | None = Field(default=None, max_length=64)
+
+
 class BatchPublishRequest(BaseModel):
-    """同批次发布请求：2～20 个不同文档，可携带幂等键防重发。
+    """同批次发布请求：2～20 个不同文档，可携带幂等键与统一公开时间。
 
     数量、重复等语义校验在路由内完成，以返回统一格式的业务错误码。
     idempotency_key 为可选、调用方保证全局唯一的键；键与按请求顺序排列的
-    (doc_id, expected_revision) 列表绑定。
+    (doc_id, expected_revision) 列表及统一的 publish_at 绑定。
+    publish_at 省略/为 null 时整批立即公开。
     """
 
     documents: list[BatchItem] = Field(default_factory=list)
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)
+    publish_at: str | None = Field(default=None, max_length=64)
 
 
 class WithdrawRequest(BaseModel):
