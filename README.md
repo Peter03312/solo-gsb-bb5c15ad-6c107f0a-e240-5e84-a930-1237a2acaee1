@@ -3,9 +3,11 @@
 档案员上传 PNG/JPEG 原图，在 **EXIF 旋正后的像素坐标系** 上标注敏感矩形及原因；
 发布时把当前标注矩形不可逆涂实为纯黑，生成剥离元数据的独立 PNG，并固化
 原图摘要、标注修订号与成品摘要。已发布成品不随后续标注变化而改变；
-公开读取只暴露发布版与遮盖信息，永不返回原图。已发布版本发现遮盖遗漏时，
-可凭文档 ID、版本号与非空原因**永久撤回**：公开读取立即拒绝，发布记录、
-成品文件与版本号序列全部保留。
+公开读取只暴露发布版与遮盖信息，永不返回原图。发布（单份或同批次）时可指定
+统一的 **UTC 公开时刻**：成品与版本号在发布当下即固化，但公开版详情与图片
+在到达该时刻前返回 404，到时自动可读、无需二次操作；省略时刻则立即公开。
+已发布版本发现遮盖遗漏时，可凭文档 ID、版本号与非空原因**永久撤回**：
+公开读取立即拒绝，发布记录、成品文件与版本号序列全部保留。
 
 技术栈：Python 3.11+ · FastAPI · Pillow · SQLite（WAL）
 
@@ -53,14 +55,14 @@ python -m pytest tests/ -q
 | GET  | `/documents/{doc_id}` | 文档元数据与发布列表 |
 | GET  | `/documents/{doc_id}/annotations` | 当前标注修订号与矩形 |
 | PUT  | `/documents/{doc_id}/annotations` | 整体替换标注，须携带当前修订号 |
-| POST | `/documents/{doc_id}/publish` | 按当前标注发布新版本（涂实+去元数据 PNG） |
+| POST | `/documents/{doc_id}/publish` | 按当前标注发布新版本（涂实+去元数据 PNG）；可选 JSON 体 `{"public_at":"…"}` 指定 UTC 公开时刻，省略立即公开 |
 | GET  | `/documents/{doc_id}/publications` | 发布版本列表（含撤回状态） |
 | POST | `/documents/{doc_id}/publications/{version}/withdraw` | 凭非空原因**永久撤回**该版本（重复撤回返回首次记录） |
 | GET  | `/documents/{doc_id}/publications/{version}/withdrawal` | 查询该版本的撤回状态、时间与原因 |
-| POST | `/publication-batches` | **同批次发布 2～20 份文档**（原子：全成功或整批失败）；可选 `idempotency_key` 防重发 |
-| GET  | `/publication-batches/{batch_id}` | 按批次标识查询清单（顺序与请求一致，含撤回状态） |
-| GET  | `/publications/{doc_id}/{version}` | 公开读取：版本元数据+遮盖坐标与原因 |
-| GET  | `/publications/{doc_id}/{version}/image` | 公开读取：发布版 PNG |
+| POST | `/publication-batches` | **同批次发布 2～20 份文档**（原子：全成功或整批失败）；可选 `idempotency_key` 防重发，可选 `public_at` 指定全批次统一 UTC 公开时刻 |
+| GET  | `/publication-batches/{batch_id}` | 按批次标识查询清单（顺序与请求一致，含撤回状态与公开时刻） |
+| GET  | `/publications/{doc_id}/{version}` | 公开读取：版本元数据+遮盖坐标与原因（未到公开时刻 404，已撤回 410） |
+| GET  | `/publications/{doc_id}/{version}/image` | 公开读取：发布版 PNG（未到公开时刻 404，已撤回 410） |
 
 ## 调用示例（curl）
 
@@ -100,9 +102,76 @@ curl -s $BASE/documents/$DOC_ID/publications   # v1 条目 withdrawn=true
 ```
 
 完整可运行脚本：`examples/demo.sh`（单份流程）、`examples/demo_batch.sh`
-（批次发布流程）、`examples/demo_idempotency.sh`（批次幂等键流程）与
+（批次发布流程）、`examples/demo_idempotency.sh`（批次幂等键流程）、
+`examples/demo_scheduled.sh`（计划公开/UTC 公开时刻流程）与
 `examples/demo_withdrawal.sh`（版本撤回流程）；
 先启动服务，再执行 `bash examples/demo_withdrawal.sh`。
+
+## 计划公开（UTC 公开时刻 `public_at`）
+
+档案员发布**单份**或**同批次**影像时，可指定统一的 UTC 公开时刻：
+
+- 请求字段 `public_at`：ISO 8601 时间、**必须显式携带时区**
+  （如 `2026-10-10T12:00:00Z`、`2026-10-10T20:00:00+08:00`），服务端统一换算为 UTC。
+- **首次提交时须晚于当前时刻且不超过 30 天**（30 天整点允许）；
+  省略或为 `null` 时**立即公开**（`public_at` 即创建时刻，行为与历史版本一致）。
+- **发布当下即生成不可变成品并占用正常版本号**（文档维度 `MAX(version)+1`，
+  单份与批次共用序列）；计划公开只影响公开读取的放行时刻，不影响版本号、
+  成品固化与不可变性。
+- 发布响应、批次查询返回 `public_at`（批次响应在顶层与每份文档条目各一份）；
+  文档详情、发布列表的每个版本条目在**末尾追加** `public_at`，原字段及顺序不变。
+- **公开时间前**：公开版详情与图片均返回 **404 `publication_not_yet_public`**，
+  不泄露遮盖信息、摘要或成品文件（图片端点同样返回 JSON 404 而非 PNG）；
+  **到时后无需再次操作即可读取**——门控按服务端当前时钟与固化的 `public_at`
+  比较自动放行。
+- **永久撤回优先于公开时间**：计划公开期间也可撤回，撤回后即返回
+  **410 `publication_withdrawn`**，时间到达也不恢复访问；已撤回版本始终 410。
+- **错误不留痕**：时间非法/过期/过远，或批次内任一文档校验、原图、成品失败，
+  都不会留下版本、批次或占用幂等键（见下"批次幂等"）。
+
+```bash
+BASE=http://localhost:8000
+
+# 单份：1 小时后公开（curl 用 -d '{}' 或省略请求体均为立即公开）
+AT=$(python3 -c "from datetime import datetime,timedelta,timezone as tz;\
+print((datetime.now(tz.utc)+timedelta(hours=1)).replace(microsecond=0).isoformat())")
+curl -sS -X POST $BASE/documents/$DOC_ID/publish \
+  -H 'Content-Type: application/json' \
+  -d "{\"public_at\":\"$AT\"}"
+# -> {"version":1,...,"created_at":"…","public_at":"2026-10-05T09:30:00+00:00"}
+
+curl -sS -o /dev/null -w "%{http_code}\n" $BASE/publications/$DOC_ID/1         # 404
+curl -sS -o /dev/null -w "%{http_code}\n" $BASE/publications/$DOC_ID/1/image   # 404
+# 到点后自动 200，无需任何操作
+```
+
+批次在同一字段上对全批次生效：
+
+```bash
+curl -sS -X POST $BASE/publication-batches \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"public_at\": \"$AT\",
+    \"documents\": [
+      {\"doc_id\": \"DOC_ID_1\", \"expected_revision\": 1},
+      {\"doc_id\": \"DOC_ID_2\", \"expected_revision\": 0}
+    ]
+  }"
+# 201：顶层 "public_at" 与每份 documents[i].public_at 相同；
+# GET /publication-batches/{id} 同样在顶层与每条返回 public_at。
+```
+
+时间参数错误（统一错误体外不附加敏感细节）：
+
+| 情形 | HTTP | code |
+| ---- | ---- | ---- |
+| 不是合法 ISO 8601，或未携带时区（如 `2026-10-10T12:00:00`） | 400 | `invalid_public_at` |
+| 不晚于当前时刻（须严格晚于；等于当前也拒绝） | 400 | `public_at_not_in_future` |
+| 晚于当前时刻 30 天以上 | 400 | `public_at_too_far_ahead` |
+| 计划版本未到公开时刻读取详情/图片 | 404 | `publication_not_yet_public` |
+
+端到端示例：`bash examples/demo_scheduled.sh`（含到期前后门控、批次计划公开、
+非法时间、幂等冲突与撤回优先的完整演示）。
 
 ## 同批次发布（2～20 份，整批原子）
 
@@ -169,16 +238,20 @@ curl -sS $BASE/publication-batches/7bc8e9008700469fb1c896990b34e620
 批量发布时网络中断可能使成功响应丢失，调用方无法判断批次是否已生效。
 `POST /publication-batches` 接受可选的 **`idempotency_key`**（1～128 字符，
 调用方保证**全局唯一**）；键与**按请求顺序排列**的 `(doc_id, expected_revision)`
-列表绑定：
+列表及 **`public_at`（省略视为 `null`，与显式给出任何时刻都不同）**绑定：
 
 - **首次成功（201）**：键与完整成功结果在同一事务内持久化。
 - **相同键 + 相同内容重试（200）**：直接返回首次持久化的原批次标识、各文档
-  版本与摘要（响应体与首次逐字节一致）——即使标注随后已变化，也**不再校验
-  当前修订号、不重新渲染、不产生第二批版本**。
-- **相同键 + 不同内容（409 `idempotency_key_conflict`）**：明确冲突，
-  原批次不受任何影响，冲突请求自身也不留任何痕迹。
-- **失败不占键**：任一校验失败（数量/重复/文档缺失/修订过期）、原图读取失败
-  或成品落盘失败都不会占用键，也不产生部分版本；修正后可用**原键**重试。
+  版本、摘要与公开时刻（响应体与首次逐字节一致）——即使标注随后已变化、
+  **即使首次指定的公开时刻现在已经过去，也不再校验时间窗**、不重新校验
+  当前修订号、不重新渲染、不产生第二批版本。
+- **相同键 + 不同内容（409 `idempotency_key_conflict`）**：文档集、修订号、
+  顺序任一变化，**或 `public_at` 不同（含省略↔显式）**即明确冲突，
+  原批次不受任何影响，冲突请求自身也不留任何痕迹。同一 UTC 瞬时的不同时区
+  写法（如 `…Z` 与表示同一时刻的 `…+08:00`）视为相同内容，可正常重放。
+- **失败不占键**：公开时间非法/过期/过远、任一校验失败（数量/重复/文档缺失/
+  修订过期）、原图读取失败或成品落盘失败都不会占用键，也不产生部分版本；
+  修正后可用**原键**重试。
 - **并发重试最多发布一次**：键的检查、发布、登记在同一写事务内串行化，
   并发相同键请求中恰好一个首次成功（201），其余为重放（200），批次标识一致。
 - 未带键的请求行为与之前完全一致：每次调用独立发布。
@@ -234,7 +307,9 @@ curl -sS -X POST $BASE/documents/$DOC_ID/publications/1/withdraw \
   文件或批次记录，版本号不复用——后续单份/批次发布继续 `MAX(version)+1`。
 - **公开面立即生效**：撤回后新发起的 `GET /publications/{doc}/{version}` 与
   `.../image` 返回 **410 `publication_withdrawn`**，不返回成品与遮盖详情；
-  成品文件保留在磁盘上，撤回生效前已开始的下载允许完成。
+  成品文件保留在磁盘上，撤回生效前已开始的下载允许完成。**撤回优先于计划
+  公开时刻**：未到 `public_at` 也可撤回，撤回后按 410 处理，时间到达也不
+  恢复访问（未撤回的计划版本到点自动放行）。
 - **幂等**：重复撤回返回首次记录（HTTP 200），撤回时间与原因不被改写；
   并发撤回与发布在同一写事务内串行化，恰好一个请求创建记录，
   失败不留部分撤回记录。
@@ -261,8 +336,12 @@ curl -sS -X POST $BASE/documents/$DOC_ID/publications/1/withdraw \
 | 400 | `empty_rectangle` | 矩形宽或高 ≤ 0 |
 | 400 | `rectangle_out_of_bounds` | 矩形越出旋正后图像边界 |
 | 400 | `reason_required` | 矩形未填写原因；撤回原因为空白 |
+| 400 | `invalid_public_at` | `public_at` 不是带显式时区的 ISO 8601 时间 |
+| 400 | `public_at_not_in_future` | `public_at` 不晚于当前时刻（须严格晚于） |
+| 400 | `public_at_too_far_ahead` | `public_at` 晚于当前时刻 30 天以上 |
 | 404 | `document_not_found` | 文档不存在（批次场景附 `position`/`doc_id`） |
 | 404 | `unknown_version` | 发布版本不存在 |
+| 404 | `publication_not_yet_public` | 版本存在但未到计划公开时刻（不泄露遮盖/成品） |
 | 404 | `batch_not_found` | 批次标识不存在 |
 | 410 | `publication_withdrawn` | 公开读取已撤回的版本（不返回成品与遮盖详情） |
 | 400 | `invalid_batch_size` | 批次文档数不在 2～20（附 `count`） |
@@ -297,6 +376,16 @@ curl -sS -X POST $BASE/documents/$DOC_ID/publications/1/withdraw \
   最多发布一次。
 - **不可变性**：标注矩形按 `(doc_id, revision)` 追加存储、历史修订永不改写；
   发布版 PNG 落盘后不改动，后续标注变化不影响已发布成品（批次产物同样如此）。
+  计划公开版本在发布当下即渲染固化成品并占用版本号，之后只等待放行时刻。
+- **计划公开门控**：`public_at` 在发布/批次事务内固化到
+  `publications.public_at`（批次另存 `publication_batches.public_at`，
+  立即公开时即创建时刻）；公开读取在确认版本存在后，**先查撤回（410 优先）**，
+  再以服务端当前 UTC 时钟比较 `public_at`，未到点统一返回
+  404 `publication_not_yet_public` 且不读取/不返回成品与遮盖信息，到点自动放行，
+  无需任何后台任务或二次操作。时间窗（严格未来、≤30 天）与幂等检查的次序为：
+  同键同内容重放直接返回首次结果、**不重新校验时间窗**；同键不同时间按
+  `idempotency_key_conflict` 拒绝；任何时间或批次文档失败随事务回滚，
+  不留版本/批次/键记录。
 - **版本撤回**：撤回的"校验 → 查重 → 登记"在同一个 `BEGIN IMMEDIATE`
   写事务内完成，与标注修改、单份/批次发布、其他撤回互斥串行；撤回记录按
   `(doc_id, version)` 主键追加、永不改写——重复撤回（含并发）命中主键直接
@@ -323,14 +412,45 @@ tests/test_batch.py  # 12 个用例：批次成功/顺序、数量与重复、�
                      #   原图不可读/写盘失败的整批回滚、版本交错、不可变性、并发
 tests/test_idempotency.py  # 10 个用例：幂等重放、内容绑定、冲突、各类失败不占键、
                            #   并发同键最多发布一次、无键请求兼容
+tests/test_scheduled_publication.py  # 31 个用例：单份/批次计划公开门控、时间窗校验、
+                                    #   失败不留版本、公开时刻纳入幂等内容、撤回优先、字段兼容
 tests/test_withdrawal.py   # 10 个用例：撤回/查询、公开读取 410、幂等重复、
                            #   列表标识、版本号不复用、批次重放不恢复、并发一致性
 examples/demo.sh             # 单份端到端 curl 示例
 examples/demo_batch.sh       # 批次发布端到端 curl 示例
 examples/demo_idempotency.sh # 批次幂等键端到端 curl 示例
+examples/demo_scheduled.sh   # 计划公开（UTC 公开时刻）端到端 curl 示例
 examples/demo_withdrawal.sh  # 版本撤回端到端 curl 示例
 Dockerfile / docker-compose.yml
 ```
+
+## 本轮变动（计划公开 / UTC 公开时刻）
+
+- `POST /documents/{doc_id}/publish` 新增可选 JSON 体 `{"public_at": "…"}`
+  （无请求体或空体仍立即公开，旧调用方式完全兼容）；
+  `POST /publication-batches` 新增同级可选字段 `public_at`，全批次统一公开。
+- 公开时刻须为**显式带时区的 ISO 8601**，首次提交严格晚于当前且不超过 30 天；
+  省略立即公开。非法/过期/过远分别返回 400 `invalid_public_at` /
+  `public_at_not_in_future` / `public_at_too_far_ahead`，失败不留下版本、
+  批次或幂等键。
+- 发布当下即渲染不可变去元数据成品并占用正常版本号（单份/批次同序列）；
+  发布响应返回 `public_at`，批次响应在顶层与每份文档条目各返回一份；
+  `GET /publication-batches/{id}` 同样返回；文档详情与发布列表条目在末尾
+  追加 `public_at`，原字段及顺序不变。
+- 新增公开门控：到点前 `GET /publications/{doc}/{version}` 与 `.../image`
+  返回 404 `publication_not_yet_public`（不泄露遮盖信息与成品），到点后按
+  服务端时钟自动放行，无需二次操作；图片端点在未到点时不触碰成品文件。
+- **永久撤回优先于公开时间**：计划公开期间撤回立即 410，时间到达不恢复；
+  已撤回版本始终 410（门控先查撤回、再比时间）。
+- `public_at` 纳入批次幂等内容：同键同内容（含时间）重试原样返回首次结果，
+  即使时间已过也不重新校验时间窗；同键不同时间（含省略↔显式）返回 409
+  `idempotency_key_conflict`；时间或任一文档失败不占用幂等键。
+- 表结构：`publications` 与 `publication_batches` 新增非空列 `public_at`；
+  旧数据卷启动时自动 `ALTER TABLE` 补列并以 `created_at` 回填
+  （历史版本视为发布当时即公开，公开面行为不变）。
+- 上传、标注、撤回、公开读取的既有路由与原响应字段均未改动/删除，仅向后
+  追加字段；Docker 启动方式（`docker compose up --build`、`uvicorn app.main:app`）
+  保持不变。
 
 ## 本轮变动（版本撤回）
 

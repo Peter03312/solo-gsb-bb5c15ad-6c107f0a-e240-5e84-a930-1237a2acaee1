@@ -10,6 +10,9 @@
 - 批次记录（publication_batches/batch_publications）与各文档 publications
   行在同一事务内提交：任一文档校验或渲染失败即整体回滚，批次下不会留下
   任何版本记录或批次号，也就不存在被占用的版本号。
+- 计划公开时刻（publications.public_at / publication_batches.public_at）
+  在发布当下固化（成品与版本号照常生成）；公开读取按当前时刻与该列比较，
+  未到点返回 404。立即公开时 public_at 即创建时刻。
 - 幂等键（batch_idempotency）与首次成功批次在同一事务内落库：键的
   检查-发布-登记被写锁串行化，并发重试最多发布一次；失败回滚时键记录
   一并撤销，调用方可用原键重试。
@@ -57,12 +60,14 @@ CREATE TABLE IF NOT EXISTS publications (
     output_path         TEXT NOT NULL,
     created_at          TEXT NOT NULL,
     batch_id            TEXT,
+    public_at           TEXT NOT NULL,            -- UTC 公开时刻（ISO 8601）
     PRIMARY KEY (doc_id, version)
 );
 
 CREATE TABLE IF NOT EXISTS publication_batches (
     id         TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    public_at  TEXT NOT NULL                     -- 全批次统一 UTC 公开时刻
 );
 
 CREATE TABLE IF NOT EXISTS batch_publications (
@@ -102,10 +107,28 @@ def init_db(db_path: str) -> None:
     conn.row_factory = sqlite3.Row
     try:
         conn.executescript(SCHEMA)
-        # 轻量迁移：旧卷上的 publications 表可能没有 batch_id 列
+        # 轻量迁移：旧卷上的 publications 表可能没有 batch_id / public_at 列
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(publications)")}
         if "batch_id" not in cols:
             conn.execute("ALTER TABLE publications ADD COLUMN batch_id TEXT")
+        if "public_at" not in cols:
+            conn.execute("ALTER TABLE publications ADD COLUMN public_at TEXT")
+            # 旧数据视为发布当时即公开：以创建时刻回填，公开面行为不变
+            conn.execute(
+                "UPDATE publications SET public_at = created_at"
+                " WHERE public_at IS NULL OR public_at = ''"
+            )
+        batch_cols = {
+            r["name"] for r in conn.execute("PRAGMA table_info(publication_batches)")
+        }
+        if "public_at" not in batch_cols:
+            conn.execute(
+                "ALTER TABLE publication_batches ADD COLUMN public_at TEXT"
+            )
+            conn.execute(
+                "UPDATE publication_batches SET public_at = created_at"
+                " WHERE public_at IS NULL OR public_at = ''"
+            )
         conn.execute("PRAGMA journal_mode=WAL")
         conn.commit()
     finally:

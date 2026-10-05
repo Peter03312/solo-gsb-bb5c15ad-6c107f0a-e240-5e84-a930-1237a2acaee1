@@ -19,6 +19,17 @@ class AnnotationsPut(BaseModel):
     rects: list[RectIn] = Field(default_factory=list, max_length=1000)
 
 
+class SinglePublishRequest(BaseModel):
+    """单份发布请求体（整体可选）：可指定统一的 UTC 公开时刻。
+
+    public_at 省略或为 null 时立即公开；提供时须为 ISO 8601 且显式带时区
+    （如 ``2026-10-10T12:00:00Z`` 或 ``2026-10-10T20:00:00+08:00``），
+    时间窗（晚于当前、不超过 30 天）在路由内校验以返回统一错误码。
+    """
+
+    public_at: str | None = Field(default=None, max_length=64)
+
+
 class BatchItem(BaseModel):
     """批次中的一项：文档 ID 与调用方预期的当前标注修订号。"""
 
@@ -31,11 +42,13 @@ class BatchPublishRequest(BaseModel):
 
     数量、重复等语义校验在路由内完成，以返回统一格式的业务错误码。
     idempotency_key 为可选、调用方保证全局唯一的键；键与按请求顺序排列的
-    (doc_id, expected_revision) 列表绑定。
+    (doc_id, expected_revision) 列表及 public_at 绑定。
+    public_at 省略或为 null 时立即公开；提供时全批次使用同一 UTC 公开时刻。
     """
 
     documents: list[BatchItem] = Field(default_factory=list)
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)
+    public_at: str | None = Field(default=None, max_length=64)
 
 
 class WithdrawRequest(BaseModel):
